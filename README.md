@@ -22,31 +22,37 @@
    - 下載與推論皆在獨立背景執行緒 (`QThread`) 運作，UI 介面完全不卡頓。
    - 支援即時 Token 串流顯示（即問即答，即時逐字輸出）。
    - 支援「🛑 停止生成」按鈕，可隨時中途打斷推論。
+   - 內建 **防複讀懲罰機制 (Repetition Penalty)**，避免小模型陷入語言循環。
 4. **推論參數自訂**：
    - 支援自訂系統提示詞（System Prompt）。
-   - 可即時調整最大長度（Max Tokens）、創意度（Temperature）、取樣核心（Top-P）。
+   - 可即時調整最大長度（Max Tokens）、創意度（Temperature）、取樣核心（Top-P）、重複懲罰（Repetition Penalty）。
 5. **深色現代化 UI**：
-   - 基於精選深色調（Slate & Indigo）設計的高質感介面。
+   - 基於精選深色調（Slate & Indigo）設計的高質感介面，氣泡對話排版清晰美觀。
 
 ---
 
-## 🚀 快速開始
+## 🚀 快速啟動
 
-### 1. 安裝環境依賴
+### 方式 1：一鍵啟動（推薦）
+在專案根目錄直接雙擊執行：
+```text
+Run_App.bat
+```
+或直接開啟位於 `dist` 目錄的正式執行檔：
+```text
+dist\SmolLMAssistant\SmolLMAssistant.exe
+```
+
+> ⚠️ **注意**：請務必開啟 **`dist`** 資料夾內的執行檔（或點擊 `Run_App.bat`），**切勿**點擊 `build` 資料夾（`build` 僅為編譯過程中的暫存暫存目錄，不包含執行所需之 DLL 模組）。
+
+---
+
+### 方式 2：使用 Python 原始碼執行
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 2. 啟動 GUI 應用程式
-
-```bash
 python app.py
 ```
-
-1. 在左側模型下拉選單選擇模型（初次使用建議選擇 `SmolLM2-135M-Instruct` 體驗秒速載入）。
-2. 點擊 **「🚀 下載並載入模型」**。
-3. 載入完成後，在下方輸入框輸入問題並按下 `Enter` 即可開始對話！
 
 ---
 
@@ -63,9 +69,6 @@ python build_exe.py
 dist/SmolLMAssistant/SmolLMAssistant.exe
 ```
 
-> 💡 **為何建議使用目錄模式 (`--onedir`)？**  
-> 由於 PyTorch 與 CUDA 函式庫龐大（數 GB），如果打包成單一檔案（`--onefile`），每次雙擊執行時 Windows 都必須花費 40~60 秒解壓縮至 `%TEMP%` 目錄才啟動。採用目錄模式可達成 **1~2 秒瞬間秒開**，體驗極佳。
-
 ---
 
 ## 🧪 執行單元測試
@@ -80,9 +83,10 @@ python -m pytest test_app.py -v
 
 ## 📂 專案檔案結構
 
+- [`Run_App.bat`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/Run_App.bat)：根目錄一鍵捷徑啟動腳本。
 - [`app.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/app.py)：GUI 主程式與對話介面邏輯。
 - [`model_worker.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/model_worker.py)：模型下載、載入與串流推論背景執行緒。
 - [`styles.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/styles.py)：現代深色風格 QSS 樣式表。
 - [`build_exe.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/build_exe.py)：PyInstaller 自動打包腳本。
-- [`test_app.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/test_app.py)：單元測試。
+- [`test_app.py`](file:///g:/My%20Drive/Google%20Antigravity/Coding/SLM_Agent/test_app.py)：單元測試。
 - [`requirements.txt`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/requirements.txt)：專案相依套件清單。

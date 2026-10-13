@@ -85,11 +85,20 @@ def build():
 
     result = subprocess.run(args, cwd=str(project_dir))
 
+    # Remove temporary build/ directory so users won't click into build/ by mistake
+    temp_build = project_dir / "build"
+    if temp_build.exists():
+        try:
+            shutil.rmtree(temp_build, ignore_errors=True)
+        except Exception:
+            pass
+
     if result.returncode == 0:
         exe_path = project_dir / "dist" / "SmolLMAssistant" / "SmolLMAssistant.exe"
         print("=" * 60)
         print("[+] Build successfully finished!")
-        print(f"Executable location: {exe_path}")
+        print(f"[!] Please run the executable from 'dist' (NOT 'build'):")
+        print(f"    {exe_path}")
         print("=" * 60)
     else:
         print(f"[-] Build failed with return code {result.returncode}")
