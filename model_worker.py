@@ -1,10 +1,13 @@
 """
 Background workers for loading models and generating text streaming.
+Supports downloading and persisting models locally next to the executable.
 """
 
 import os
+import sys
 import time
 import threading
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 # Disable unnecessary warnings
@@ -12,6 +15,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import torch
 from PyQt6.QtCore import QThread, pyqtSignal
+from huggingface_hub import snapshot_download
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -19,6 +23,41 @@ from transformers import (
     StoppingCriteria,
     StoppingCriteriaList,
 )
+
+
+def get_base_dir() -> Path:
+    """Get directory of the executable when frozen, or script directory."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.resolve()
+    try:
+        return Path(__file__).parent.resolve()
+    except NameError:
+        return Path.cwd().resolve()
+
+
+def get_default_models_dir() -> Path:
+    """Get the models directory located right next to the executable / app."""
+    models_dir = get_base_dir() / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    return models_dir
+
+
+def is_model_downloaded_locally(model_id: str, models_dir: Optional[Path] = None) -> bool:
+    """Check if model files are already downloaded in the local directory."""
+    if not model_id or model_id == "custom":
+        return False
+    if models_dir is None:
+        models_dir = get_default_models_dir()
+
+    folder_name = model_id.strip().split("/")[-1]
+    target_dir = models_dir / folder_name
+
+    if not target_dir.exists() or not (target_dir / "config.json").exists():
+        return False
+
+    # Check for weights file
+    has_weights = any(target_dir.glob("*.safetensors")) or any(target_dir.glob("*.bin"))
+    return has_weights
 
 
 class StopSignalCriteria(StoppingCriteria):
@@ -36,19 +75,36 @@ class StopSignalCriteria(StoppingCriteria):
 
 
 class ModelLoaderWorker(QThread):
-    """Worker thread to download and initialize tokenizer and model."""
+    """Worker thread to download and initialize tokenizer and model into local disk."""
 
     progress_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(bool, str, object, object)  # success, message, tokenizer, model
+    finished_signal = pyqtSignal(bool, str, object, object, str)  # success, message, tokenizer, model, local_path
 
-    def __init__(self, model_id: str, device_choice: str = "Auto"):
+    def __init__(self, model_id: str, device_choice: str = "Auto", models_dir: Optional[Path] = None):
         super().__init__()
         self.model_id = model_id.strip()
         self.device_choice = device_choice
+        self.models_dir = models_dir or get_default_models_dir()
 
     def run(self):
         try:
-            self.progress_signal.emit(f"Connecting to Hugging Face and fetching {self.model_id}...")
+            folder_name = self.model_id.split("/")[-1]
+            local_model_path = self.models_dir / folder_name
+            local_model_path.mkdir(parents=True, exist_ok=True)
+
+            # Check if model is already stored locally
+            already_downloaded = is_model_downloaded_locally(self.model_id, self.models_dir)
+
+            if already_downloaded:
+                self.progress_signal.emit(f"本地已存在模型檔案，直接從本機載入：\n{local_model_path.name}")
+            else:
+                self.progress_signal.emit(f"正在從 Hugging Face 下載 {self.model_id} 至本地目錄：\n{local_model_path} ...")
+                # Download to local directory directly
+                snapshot_download(
+                    repo_id=self.model_id,
+                    local_dir=str(local_model_path),
+                )
+                self.progress_signal.emit(f"下載完成！模型已保存在本地：{local_model_path.name}")
 
             # Determine device
             if self.device_choice == "CUDA" and torch.cuda.is_available():
@@ -58,10 +114,17 @@ class ModelLoaderWorker(QThread):
             else:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-            # Load Tokenizer
-            self.progress_signal.emit(f"Loading tokenizer for {self.model_id}...")
+            # Determine dtype
+            if device == "cuda":
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            else:
+                dtype = torch.float32
+
+            # Load Tokenizer from local directory
+            self.progress_signal.emit("讀取 Tokenizer 分詞器...")
             tokenizer = AutoTokenizer.from_pretrained(
-                self.model_id,
+                str(local_model_path),
+                local_files_only=True,
                 trust_remote_code=True,
             )
 
@@ -69,31 +132,26 @@ class ModelLoaderWorker(QThread):
             if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
                 tokenizer.pad_token_id = tokenizer.eos_token_id
 
-            # Determine dtype
-            if device == "cuda":
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            else:
-                dtype = torch.float32
-
-            self.progress_signal.emit(f"Loading weights ({device.upper()} - {str(dtype).replace('torch.', '')})...")
-
+            # Load Model from local directory
+            self.progress_signal.emit(f"載入神經網路權重 ({device.upper()} - {str(dtype).replace('torch.', '')})...")
             model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
+                str(local_model_path),
                 dtype=dtype,
                 low_cpu_mem_usage=True,
+                local_files_only=True,
                 trust_remote_code=True,
             )
 
-            self.progress_signal.emit(f"Moving model to {device.upper()}...")
+            self.progress_signal.emit(f"配置至運行裝置 {device.upper()}...")
             model = model.to(device)
             model.eval()
 
-            self.progress_signal.emit("Model loaded successfully!")
-            self.finished_signal.emit(True, f"Model loaded on {device.upper()}", tokenizer, model)
+            self.progress_signal.emit("模型載入成功！")
+            self.finished_signal.emit(True, f"本地模型已就緒 ({device.upper()})", tokenizer, model, str(local_model_path))
 
         except Exception as e:
             err_msg = str(e)
-            self.finished_signal.emit(False, f"Failed to load model: {err_msg}", None, None)
+            self.finished_signal.emit(False, f"載入失敗: {err_msg}", None, None, "")
 
 
 class TextGeneratorWorker(QThread):

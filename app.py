@@ -1,10 +1,14 @@
 """
 SmolLM Desktop AI Assistant - Modern PyQt6 GUI
+Default Model: SmolLM2-1.7B-Instruct
+Local Storage: ./models next to executable
 """
 
 import sys
 import os
 import html
+import subprocess
+from pathlib import Path
 from typing import Optional
 import torch
 
@@ -31,12 +35,17 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QKeyEvent
 
 from styles import DARK_THEME
-from model_worker import ModelLoaderWorker, TextGeneratorWorker
+from model_worker import (
+    ModelLoaderWorker,
+    TextGeneratorWorker,
+    get_default_models_dir,
+    is_model_downloaded_locally,
+)
 
 PRESET_MODELS = [
+    ("HuggingFaceTB/SmolLM2-1.7B-Instruct (內定預設 1.7B / ~3.4GB)", "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
     ("HuggingFaceTB/SmolLM2-135M-Instruct (超輕量 135M / ~270MB)", "HuggingFaceTB/SmolLM2-135M-Instruct"),
     ("HuggingFaceTB/SmolLM2-360M-Instruct (輕量 360M / ~720MB)", "HuggingFaceTB/SmolLM2-360M-Instruct"),
-    ("HuggingFaceTB/SmolLM2-1.7B-Instruct (高品質 1.7B / ~3.4GB)", "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
     ("HuggingFaceTB/SmolLM3-3B (最新 SmolLM3 3B / ~6GB)", "HuggingFaceTB/SmolLM3-3B"),
     ("Qwen/Qwen2.5-0.5B-Instruct (阿里千問 0.5B / ~1GB)", "Qwen/Qwen2.5-0.5B-Instruct"),
     ("自訂模型 (Custom Hugging Face Repo ID)", "custom"),
@@ -63,14 +72,18 @@ class ChatInputEdit(QPlainTextEdit):
 class SmolLMAssistantWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SmolLM AI Assistant - Hugging Face Desktop")
-        self.resize(1100, 780)
-        self.setMinimumSize(850, 600)
+        self.setWindowTitle("SmolLM AI Assistant - Local SLM Desktop")
+        self.resize(1120, 800)
+        self.setMinimumSize(880, 620)
+
+        # Base directories
+        self.models_dir = get_default_models_dir()
 
         # Model state
         self.tokenizer = None
         self.model = None
         self.current_model_id = ""
+        self.current_local_path = ""
         self.conversation_history = []
         self.current_streaming_text = ""
         self.loader_worker = None
@@ -78,6 +91,7 @@ class SmolLMAssistantWindow(QMainWindow):
 
         self.init_ui()
         self.detect_hardware()
+        self.update_model_status_display()
 
     def init_ui(self):
         central_widget = QWidget(self)
@@ -97,8 +111,7 @@ class SmolLMAssistantWindow(QMainWindow):
         chat_area = self.create_chat_area()
         splitter.addWidget(chat_area)
 
-        # Set proportion: 320px sidebar, rest for chat
-        splitter.setSizes([320, 780])
+        splitter.setSizes([330, 790])
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
 
@@ -145,9 +158,28 @@ class SmolLMAssistantWindow(QMainWindow):
 
         # Custom Model ID input
         self.custom_model_input = QLineEdit()
-        self.custom_model_input.setPlaceholderText("例如: HuggingFaceTB/SmolLM3-3B")
+        self.custom_model_input.setPlaceholderText("例如: HuggingFaceTB/SmolLM2-1.7B-Instruct")
         self.custom_model_input.setVisible(False)
+        self.custom_model_input.textChanged.connect(self.update_model_status_display)
         mc_layout.addWidget(self.custom_model_input)
+
+        # Local storage location indicator
+        self.path_box = QVBoxLayout()
+        path_title = QLabel("📁 本機儲存位置 (執行檔旁):")
+        path_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        self.path_label = QLabel(str(self.models_dir))
+        self.path_label.setStyleSheet("color: #cbd5e1; font-size: 10px; background: #0f172a; padding: 4px; border-radius: 4px;")
+        self.path_label.setWordWrap(True)
+        self.path_box.addWidget(path_title)
+        self.path_box.addWidget(self.path_label)
+
+        # Open folder button
+        self.open_folder_btn = QPushButton("📂 開啟本機模型目錄")
+        self.open_folder_btn.setObjectName("secondaryButton")
+        self.open_folder_btn.setFixedHeight(26)
+        self.open_folder_btn.clicked.connect(self.open_models_directory)
+        self.path_box.addWidget(self.open_folder_btn)
+        mc_layout.addLayout(self.path_box)
 
         # Hardware Device
         dev_label = QLabel("運行裝置 (Hardware Device)")
@@ -160,8 +192,8 @@ class SmolLMAssistantWindow(QMainWindow):
         self.device_combo.addItem("CPU 處理器 (純 CPU)", "CPU")
         mc_layout.addWidget(self.device_combo)
 
-        # Load Button
-        self.load_model_btn = QPushButton("🚀 下載並載入模型")
+        # Load / Download Button
+        self.load_model_btn = QPushButton("⚡ 直接載入本地模型")
         self.load_model_btn.setFixedHeight(36)
         self.load_model_btn.clicked.connect(self.start_loading_model)
         mc_layout.addWidget(self.load_model_btn)
@@ -184,7 +216,7 @@ class SmolLMAssistantWindow(QMainWindow):
         param_card = QFrame()
         param_card.setObjectName("cardFrame")
         p_layout = QVBoxLayout(param_card)
-        p_layout.setSpacing(10)
+        p_layout.setSpacing(8)
 
         p_title = QLabel("推論參數 (Inference Config)")
         p_title.setObjectName("sectionTitle")
@@ -220,7 +252,7 @@ class SmolLMAssistantWindow(QMainWindow):
         topp_box.addWidget(self.topp_spin)
         p_layout.addLayout(topp_box)
 
-        # Repetition Penalty (prevents infinite repetition loops)
+        # Repetition Penalty
         rep_box = QHBoxLayout()
         rep_box.addWidget(QLabel("重複懲罰 (Repetition Penalty):"))
         self.rep_spin = QDoubleSpinBox()
@@ -234,9 +266,9 @@ class SmolLMAssistantWindow(QMainWindow):
         sys_label = QLabel("系統提示詞 (System Prompt):")
         p_layout.addWidget(sys_label)
         self.system_prompt_edit = QPlainTextEdit()
-        self.system_prompt_edit.setFixedHeight(70)
+        self.system_prompt_edit.setFixedHeight(65)
         self.system_prompt_edit.setPlainText(
-            "You are SmolLM, a friendly, helpful, and concise AI assistant developed by Hugging Face."
+            "You are SmolLM, a friendly, knowledgeable, and concise AI assistant developed by Hugging Face."
         )
         p_layout.addWidget(self.system_prompt_edit)
 
@@ -263,7 +295,7 @@ class SmolLMAssistantWindow(QMainWindow):
 
         # Top status banner
         top_bar = QHBoxLayout()
-        self.chat_header_status = QLabel("⚪ 未載入模型，請先在左側點選「下載並載入模型」")
+        self.chat_header_status = QLabel("⚪ 未載入模型，請先在左側確認並載入模型")
         self.chat_header_status.setStyleSheet("color: #94a3b8; font-weight: 500;")
         top_bar.addWidget(self.chat_header_status)
 
@@ -331,9 +363,46 @@ class SmolLMAssistantWindow(QMainWindow):
         else:
             self.hw_label.setText("💻 使用 CPU 模式 (未檢測到 CUDA GPU)")
 
+    def get_current_model_id(self) -> str:
+        selected_data = self.model_combo.currentData()
+        if selected_data == "custom":
+            return self.custom_model_input.text().strip()
+        return selected_data
+
     def on_model_changed(self):
         selected_data = self.model_combo.currentData()
         self.custom_model_input.setVisible(selected_data == "custom")
+        self.update_model_status_display()
+
+    def update_model_status_display(self):
+        """Check if selected model exists in local folder and update UI state."""
+        model_id = self.get_current_model_id()
+        if not model_id:
+            self.load_status_label.setText("請選擇或輸入模型 ID")
+            self.load_model_btn.setText("🚀 載入模型")
+            return
+
+        is_downloaded = is_model_downloaded_locally(model_id, self.models_dir)
+        folder_name = model_id.split("/")[-1]
+
+        if is_downloaded:
+            self.load_status_label.setText(f"💾 本機已存在 ({folder_name})，免連網直接載入")
+            self.load_status_label.setStyleSheet("color: #4ade80; font-size: 11px;")
+            self.load_model_btn.setText(f"⚡ 直接載入本地模型 ({folder_name})")
+        else:
+            self.load_status_label.setText(f"🌐 尚未下載至本地，首次載入將自動下載至 ./models/{folder_name}")
+            self.load_status_label.setStyleSheet("color: #38bdf8; font-size: 11px;")
+            self.load_model_btn.setText(f"📥 下載並載入模型 ({folder_name})")
+
+    def open_models_directory(self):
+        """Open the local models directory in Windows Explorer."""
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(self.models_dir))
+            else:
+                subprocess.Popen(["xdg-open", str(self.models_dir)])
+        except Exception as e:
+            QMessageBox.warning(self, "開啟目錄失敗", str(e))
 
     def get_welcome_html(self) -> str:
         return """
@@ -343,11 +412,11 @@ class SmolLMAssistantWindow(QMainWindow):
                 本程式由 Hugging Face Transformers 與 PyTorch 本地驅動，具備隱私、免聯網推論與 GPU 加速能力。
             </p>
             <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 15px; margin: 20px auto; max-width: 620px; text-align: left;">
-                <b style="color: #f8fafc;">💡 快速開始指南：</b><br>
+                <b style="color: #f8fafc;">💡 核心設計特點：</b><br>
                 <ol style="color: #cbd5e1; margin-top: 8px; line-height: 1.8;">
-                    <li>在左側選擇想體驗的模型（推薦初次使用 <b>SmolLM2-135M-Instruct</b>，僅 ~270MB，數秒內即可載入完畢；亦可選擇最新 <b>SmolLM3-3B</b>）。</li>
-                    <li>點選 <b>「下載並載入模型」</b>（模型權重會自動下載並快取在本地）。</li>
-                    <li>載入完成後即可在下方輸入問題進行問答，支援即時流式 Token 輸出與中途停止！</li>
+                    <li>預設內定模型為 <b>SmolLM2-1.7B-Instruct</b>，品質與推理能力優秀。</li>
+                    <li><b>直接持久化保存在執行檔旁的 <code>models/</code> 目錄</b>，只要下載過一次，往後皆可秒速離線載入！</li>
+                    <li>支援即時 Token 流式輸出、即時中途停止、硬體監控與防複讀懲罰機制。</li>
                 </ol>
             </div>
         </div>
@@ -410,25 +479,21 @@ class SmolLMAssistantWindow(QMainWindow):
             sb.setValue(sb.maximum())
 
     def start_loading_model(self):
-        selected_data = self.model_combo.currentData()
-        if selected_data == "custom":
-            model_id = self.custom_model_input.text().strip()
-            if not model_id:
-                QMessageBox.warning(self, "請輸入模型 ID", "請在輸入框中輸入 Hugging Face 倉庫 ID，例如 HuggingFaceTB/SmolLM3-3B")
-                return
-        else:
-            model_id = selected_data
+        model_id = self.get_current_model_id()
+        if not model_id:
+            QMessageBox.warning(self, "請輸入模型 ID", "請在輸入框中輸入 Hugging Face 倉庫 ID，例如 HuggingFaceTB/SmolLM2-1.7B-Instruct")
+            return
 
         device_choice = self.device_combo.currentData()
 
         # UI state during load
         self.load_model_btn.setEnabled(False)
         self.load_progress_bar.setVisible(True)
-        self.load_status_label.setText(f"正在下載/載入 {model_id}...")
+        self.load_status_label.setText(f"處理中: {model_id}...")
         self.chat_header_status.setText(f"⏳ 正在載入模型: {model_id}，請稍候...")
 
         # Worker
-        self.loader_worker = ModelLoaderWorker(model_id, device_choice)
+        self.loader_worker = ModelLoaderWorker(model_id, device_choice, self.models_dir)
         self.loader_worker.progress_signal.connect(self.on_load_progress)
         self.loader_worker.finished_signal.connect(self.on_load_finished)
         self.loader_worker.start()
@@ -436,25 +501,30 @@ class SmolLMAssistantWindow(QMainWindow):
     def on_load_progress(self, msg: str):
         self.load_status_label.setText(msg)
 
-    def on_load_finished(self, success: bool, message: str, tokenizer, model):
+    def on_load_finished(self, success: bool, message: str, tokenizer, model, local_path: str):
         self.load_model_btn.setEnabled(True)
         self.load_progress_bar.setVisible(False)
 
         if success:
             self.tokenizer = tokenizer
             self.model = model
-            selected_data = self.model_combo.currentData()
-            self.current_model_id = self.custom_model_input.text().strip() if selected_data == "custom" else selected_data
+            self.current_model_id = self.get_current_model_id()
+            self.current_local_path = local_path
 
-            self.load_status_label.setText(f"✅ {message}")
-            self.chat_header_status.setText(f"🟢 已就緒: {self.current_model_id} ({message})")
+            self.load_status_label.setText(f"✅ {message}\n路徑: {Path(local_path).name}")
+            self.chat_header_status.setText(f"🟢 已就緒: {self.current_model_id} (本機持久化)")
 
             # Update hardware card with current memory
             if torch.cuda.is_available() and next(model.parameters()).is_cuda:
                 allocated = round(torch.cuda.memory_allocated(0) / (1024**3), 2)
                 self.hw_label.setText(f"⚡ GPU: {torch.cuda.get_device_name(0)}\n📊 模型佔用 VRAM: {allocated} GB")
 
-            QMessageBox.information(self, "模型載入完成", f"模型 {self.current_model_id} 已成功載入並可以使用！")
+            self.update_model_status_display()
+            QMessageBox.information(
+                self,
+                "模型載入完成",
+                f"模型已就緒並儲存於本機：\n{local_path}\n\n下次啟動將直接讀取本機檔案，無需重複下載！"
+            )
         else:
             self.load_status_label.setText("❌ 載入失敗")
             self.chat_header_status.setText("🔴 模型載入失敗")
@@ -462,7 +532,7 @@ class SmolLMAssistantWindow(QMainWindow):
 
     def send_message(self):
         if self.model is None or self.tokenizer is None:
-            QMessageBox.warning(self, "模型尚未載入", "請先點選左側面板的「🚀 下載並載入模型」以載入語言模型！")
+            QMessageBox.warning(self, "模型尚未載入", "請先點選左側面板的載入按鈕以載入語言模型！")
             return
 
         user_text = self.input_edit.toPlainText().strip()
@@ -515,7 +585,6 @@ class SmolLMAssistantWindow(QMainWindow):
         self.current_streaming_text = ""
         self.render_chat()
 
-        # Calculate speed
         speed = round(token_count / elapsed, 1) if elapsed > 0 else 0
         self.speed_label.setText(f"⚡ 推論速度: {speed} tokens/s ({token_count} 字元 / {round(elapsed, 2)}秒)")
 
