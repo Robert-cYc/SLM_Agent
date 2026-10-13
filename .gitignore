@@ -29,3 +29,5 @@ models/
 Thumbs.db
 .vscode/
 .idea/
+logs/
+

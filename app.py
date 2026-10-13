@@ -1,624 +1,743 @@
 """
-SmolLM Desktop AI Assistant - Modern PyQt6 GUI
-Default Model: SmolLM2-1.7B-Instruct
-Local Storage: ./models next to executable
+SmolLM Studio - desktop chat client for local Hugging Face small language models.
+
+Default model: SmolLM2-1.7B-Instruct, persisted under ./models next to the executable.
 """
 
-import sys
+import gc
+import logging
 import os
-import html
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
-import torch
 
-from PyQt6.QtWidgets import (
+
+def _ensure_std_streams() -> None:
+    """Windowed PyInstaller builds have no console; give libraries (tqdm, logging) a sink."""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+_ensure_std_streams()
+
+# Heavy imports intentionally follow the stream guard above.
+import torch  # noqa: E402
+from PyQt6.QtCore import QTimer, QUrl  # noqa: E402
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QFont, QKeySequence, QResizeEvent, QShortcut  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
     QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
-    QComboBox,
     QLineEdit,
-    QPlainTextEdit,
-    QTextBrowser,
-    QDoubleSpinBox,
-    QSpinBox,
-    QFrame,
-    QSplitter,
+    QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStatusBar,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QKeyEvent
+from PyQt6.QtCore import Qt  # noqa: E402
 
-from styles import DARK_THEME
-from model_worker import (
+from chat_renderer import SUGGESTIONS, ChatMessage, render_message, render_welcome, wrap_document  # noqa: E402
+from model_worker import (  # noqa: E402
     ModelLoaderWorker,
     TextGeneratorWorker,
+    get_base_dir,
     get_default_models_dir,
     is_model_downloaded_locally,
 )
+from styles import APP_STYLESHEET, CHAT_DOCUMENT_CSS, UI_FONT_FAMILY  # noqa: E402
+from widgets import (  # noqa: E402
+    ChatInputEdit,
+    StatusIndicator,
+    create_app_icon,
+    make_divider,
+    make_field_label,
+    make_section_header,
+)
 
-PRESET_MODELS = [
-    ("HuggingFaceTB/SmolLM2-1.7B-Instruct (內定預設 1.7B / ~3.4GB)", "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
-    ("HuggingFaceTB/SmolLM2-135M-Instruct (超輕量 135M / ~270MB)", "HuggingFaceTB/SmolLM2-135M-Instruct"),
-    ("HuggingFaceTB/SmolLM2-360M-Instruct (輕量 360M / ~720MB)", "HuggingFaceTB/SmolLM2-360M-Instruct"),
-    ("HuggingFaceTB/SmolLM3-3B (最新 SmolLM3 3B / ~6GB)", "HuggingFaceTB/SmolLM3-3B"),
-    ("Qwen/Qwen2.5-0.5B-Instruct (阿里千問 0.5B / ~1GB)", "Qwen/Qwen2.5-0.5B-Instruct"),
-    ("自訂模型 (Custom Hugging Face Repo ID)", "custom"),
+logger = logging.getLogger(__name__)
+
+APP_NAME = "SmolLM Studio"
+APP_VERSION = "1.2.0"
+
+PRESET_MODELS: list[tuple[str, str]] = [
+    ("SmolLM2 1.7B Instruct  ·  3.4 GB  (預設)", "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
+    ("SmolLM2 360M Instruct  ·  720 MB", "HuggingFaceTB/SmolLM2-360M-Instruct"),
+    ("SmolLM2 135M Instruct  ·  270 MB", "HuggingFaceTB/SmolLM2-135M-Instruct"),
+    ("SmolLM3 3B  ·  6 GB", "HuggingFaceTB/SmolLM3-3B"),
+    ("Qwen2.5 0.5B Instruct  ·  1 GB", "Qwen/Qwen2.5-0.5B-Instruct"),
+    ("自訂 Hugging Face Repo ID…", "custom"),
 ]
+DEFAULT_MODEL_ID = PRESET_MODELS[0][1]
+DEFAULT_SYSTEM_PROMPT = "You are SmolLM, a helpful, accurate and concise AI assistant."
+
+SIDEBAR_WIDTH_PX = 330
+CHAT_MAX_WIDTH_PX = 820
+CHAT_SIDE_PADDING_PX = 56
+VRAM_REFRESH_MS = 2000
 
 
-class ChatInputEdit(QPlainTextEdit):
-    """Text edit that submits on Enter and inserts newline on Shift+Enter."""
-
-    def __init__(self, submit_callback, parent=None):
-        super().__init__(parent)
-        self.submit_callback = submit_callback
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                super().keyPressEvent(event)
-            else:
-                self.submit_callback()
-        else:
-            super().keyPressEvent(event)
-
-
-class SmolLMAssistantWindow(QMainWindow):
-    def __init__(self):
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SmolLM AI Assistant - Local SLM Desktop")
-        self.resize(1120, 800)
-        self.setMinimumSize(880, 620)
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(create_app_icon())
+        self.resize(1240, 820)
+        self.setMinimumSize(960, 640)
 
-        # Base directories
         self.models_dir = get_default_models_dir()
-
-        # Model state
         self.tokenizer = None
         self.model = None
-        self.current_model_id = ""
-        self.current_local_path = ""
-        self.conversation_history = []
-        self.current_streaming_text = ""
-        self.loader_worker = None
-        self.gen_worker = None
+        self.loaded_model_id = ""
+        self.device_summary = ""
+        self.messages: list[ChatMessage] = []
+        self._message_html: list[str] = []
+        self.streaming_text: Optional[str] = None
+        self._loading_model_id = ""
+        self._is_loading = False
+        self._stop_requested = False
+        self.loader_worker: Optional[ModelLoaderWorker] = None
+        self.gen_worker: Optional[TextGeneratorWorker] = None
 
-        self.init_ui()
-        self.detect_hardware()
-        self.update_model_status_display()
-
-    def init_ui(self):
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(14)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(4)
-
-        # 1. Left Sidebar: Settings & Model Management
-        sidebar = self.create_sidebar()
-        splitter.addWidget(sidebar)
-
-        # 2. Right Main Area: Chat Window
-        chat_area = self.create_chat_area()
-        splitter.addWidget(chat_area)
-
-        splitter.setSizes([330, 790])
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-
-        main_layout.addWidget(splitter)
-
-    def create_sidebar(self) -> QWidget:
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebarFrame")
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
-
-        # App Title Header
-        title_box = QVBoxLayout()
-        title = QLabel("🤖 SmolLM Studio")
-        title.setObjectName("titleLabel")
-        subtitle = QLabel("Local Hugging Face SLM GUI")
-        subtitle.setObjectName("subTitleLabel")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        layout.addLayout(title_box)
-
-        # Separator line
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("background-color: #1e293b; max-height: 1px;")
-        layout.addWidget(line)
-
-        # Model Selection Card
-        model_card = QFrame()
-        model_card.setObjectName("cardFrame")
-        mc_layout = QVBoxLayout(model_card)
-        mc_layout.setSpacing(8)
-
-        m_label = QLabel("模型選擇 (Model)")
-        m_label.setObjectName("sectionTitle")
-        mc_layout.addWidget(m_label)
-
-        self.model_combo = QComboBox()
-        for label, val in PRESET_MODELS:
-            self.model_combo.addItem(label, val)
-        self.model_combo.currentIndexChanged.connect(self.on_model_changed)
-        mc_layout.addWidget(self.model_combo)
-
-        # Custom Model ID input
-        self.custom_model_input = QLineEdit()
-        self.custom_model_input.setPlaceholderText("例如: HuggingFaceTB/SmolLM2-1.7B-Instruct")
-        self.custom_model_input.setVisible(False)
-        self.custom_model_input.textChanged.connect(self.update_model_status_display)
-        mc_layout.addWidget(self.custom_model_input)
-
-        # Local storage location indicator
-        self.path_box = QVBoxLayout()
-        path_title = QLabel("📁 本機儲存位置 (執行檔旁):")
-        path_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
-        self.path_label = QLabel(str(self.models_dir))
-        self.path_label.setStyleSheet("color: #cbd5e1; font-size: 10px; background: #0f172a; padding: 4px; border-radius: 4px;")
-        self.path_label.setWordWrap(True)
-        self.path_box.addWidget(path_title)
-        self.path_box.addWidget(self.path_label)
-
-        # Open folder button
-        self.open_folder_btn = QPushButton("📂 開啟本機模型目錄")
-        self.open_folder_btn.setObjectName("secondaryButton")
-        self.open_folder_btn.setFixedHeight(26)
-        self.open_folder_btn.clicked.connect(self.open_models_directory)
-        self.path_box.addWidget(self.open_folder_btn)
-        mc_layout.addLayout(self.path_box)
-
-        # Hardware Device
-        dev_label = QLabel("運行裝置 (Hardware Device)")
-        dev_label.setObjectName("sectionTitle")
-        mc_layout.addWidget(dev_label)
-
-        self.device_combo = QComboBox()
-        self.device_combo.addItem("自動檢測 (Auto: GPU優先)", "Auto")
-        self.device_combo.addItem("NVIDIA CUDA (GPU 加速)", "CUDA")
-        self.device_combo.addItem("CPU 處理器 (純 CPU)", "CPU")
-        mc_layout.addWidget(self.device_combo)
-
-        # Load / Download Button
-        self.load_model_btn = QPushButton("⚡ 直接載入本地模型")
-        self.load_model_btn.setFixedHeight(36)
-        self.load_model_btn.clicked.connect(self.start_loading_model)
-        mc_layout.addWidget(self.load_model_btn)
-
-        # Progress bar
-        self.load_progress_bar = QProgressBar()
-        self.load_progress_bar.setVisible(False)
-        self.load_progress_bar.setRange(0, 0)
-        mc_layout.addWidget(self.load_progress_bar)
-
-        # Loading Status label
-        self.load_status_label = QLabel("狀態: 尚未載入模型")
-        self.load_status_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        self.load_status_label.setWordWrap(True)
-        mc_layout.addWidget(self.load_status_label)
-
-        layout.addWidget(model_card)
-
-        # Parameters Card
-        param_card = QFrame()
-        param_card.setObjectName("cardFrame")
-        p_layout = QVBoxLayout(param_card)
-        p_layout.setSpacing(8)
-
-        p_title = QLabel("推論參數 (Inference Config)")
-        p_title.setObjectName("sectionTitle")
-        p_layout.addWidget(p_title)
-
-        # Max New Tokens
-        tokens_box = QHBoxLayout()
-        tokens_box.addWidget(QLabel("最大長度 (Max Tokens):"))
-        self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(32, 4096)
-        self.max_tokens_spin.setValue(512)
-        self.max_tokens_spin.setSingleStep(64)
-        tokens_box.addWidget(self.max_tokens_spin)
-        p_layout.addLayout(tokens_box)
-
-        # Temperature
-        temp_box = QHBoxLayout()
-        temp_box.addWidget(QLabel("創意度 (Temperature):"))
-        self.temp_spin = QDoubleSpinBox()
-        self.temp_spin.setRange(0.0, 1.5)
-        self.temp_spin.setValue(0.7)
-        self.temp_spin.setSingleStep(0.05)
-        temp_box.addWidget(self.temp_spin)
-        p_layout.addLayout(temp_box)
-
-        # Top-P
-        topp_box = QHBoxLayout()
-        topp_box.addWidget(QLabel("取樣核心 (Top-P):"))
-        self.topp_spin = QDoubleSpinBox()
-        self.topp_spin.setRange(0.1, 1.0)
-        self.topp_spin.setValue(0.9)
-        self.topp_spin.setSingleStep(0.05)
-        topp_box.addWidget(self.topp_spin)
-        p_layout.addLayout(topp_box)
-
-        # Repetition Penalty
-        rep_box = QHBoxLayout()
-        rep_box.addWidget(QLabel("重複懲罰 (Repetition Penalty):"))
-        self.rep_spin = QDoubleSpinBox()
-        self.rep_spin.setRange(1.0, 2.0)
-        self.rep_spin.setValue(1.15)
-        self.rep_spin.setSingleStep(0.05)
-        rep_box.addWidget(self.rep_spin)
-        p_layout.addLayout(rep_box)
-
-        # System Prompt
-        sys_label = QLabel("系統提示詞 (System Prompt):")
-        p_layout.addWidget(sys_label)
-        self.system_prompt_edit = QPlainTextEdit()
-        self.system_prompt_edit.setFixedHeight(65)
-        self.system_prompt_edit.setPlainText(
-            "You are SmolLM, a friendly, knowledgeable, and concise AI assistant developed by Hugging Face."
+        self._gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+        self._gpu_total_gb = (
+            torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0.0
         )
-        p_layout.addWidget(self.system_prompt_edit)
 
-        layout.addWidget(param_card)
+        self._resize_timer = QTimer(self, singleShot=True, interval=60)
+        self._resize_timer.timeout.connect(self._refresh_chat)
 
-        # Hardware Info Card
-        self.hardware_card = QFrame()
-        self.hardware_card.setObjectName("cardFrame")
-        hw_layout = QVBoxLayout(self.hardware_card)
-        self.hw_label = QLabel("硬體狀態檢測中...")
-        self.hw_label.setStyleSheet("color: #38bdf8; font-size: 11px;")
-        self.hw_label.setWordWrap(True)
-        hw_layout.addWidget(self.hw_label)
-        layout.addWidget(self.hardware_card)
+        self._build_ui()
+        self._build_status_bar()
+        self._install_shortcuts()
+        self._update_model_availability()
+        self._set_session_state("idle")
+        self._refresh_chat()
 
-        layout.addStretch()
+        self._vram_timer = QTimer(self, interval=VRAM_REFRESH_MS)
+        self._vram_timer.timeout.connect(self._update_device_label)
+        self._vram_timer.start()
+        self._update_device_label()
+
+        QTimer.singleShot(400, self._auto_load_default_model)
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self) -> None:
+        root = QWidget()
+        root.setObjectName("root")
+        layout = QHBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_sidebar())
+        layout.addWidget(self._build_main_area(), 1)
+        self.setCentralWidget(root)
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(SIDEBAR_WIDTH_PX)
+        outer = QVBoxLayout(sidebar)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        outer.addWidget(self._build_brand())
+        outer.addWidget(make_divider())
+
+        scroll = QScrollArea()
+        scroll.setObjectName("sidebarScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+
+        content = QWidget()
+        content.setObjectName("sidebarContent")
+        form = QVBoxLayout(content)
+        form.setContentsMargins(18, 16, 18, 16)
+        form.setSpacing(8)
+
+        self._build_model_section(form)
+        form.addSpacing(14)
+        self._build_device_section(form)
+        form.addSpacing(14)
+        self._build_generation_section(form)
+        form.addSpacing(14)
+        form.addWidget(make_section_header("系統提示詞"))
+        self.system_prompt_edit = QPlainTextEdit(DEFAULT_SYSTEM_PROMPT)
+        self.system_prompt_edit.setFixedHeight(88)
+        self.system_prompt_edit.setToolTip("每次對話開頭提供給模型的角色設定")
+        form.addWidget(self.system_prompt_edit)
+        form.addStretch(1)
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        outer.addWidget(make_divider())
+        outer.addWidget(self._build_storage_footer())
         return sidebar
 
-    def create_chat_area(self) -> QWidget:
-        chat_container = QWidget()
-        layout = QVBoxLayout(chat_container)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def _build_brand(self) -> QWidget:
+        brand = QWidget()
+        layout = QHBoxLayout(brand)
+        layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(10)
 
-        # Top status banner
-        top_bar = QHBoxLayout()
-        self.chat_header_status = QLabel("⚪ 未載入模型，請先在左側確認並載入模型")
-        self.chat_header_status.setStyleSheet("color: #94a3b8; font-weight: 500;")
-        top_bar.addWidget(self.chat_header_status)
+        icon = QLabel()
+        icon.setPixmap(create_app_icon().pixmap(30, 30))
+        layout.addWidget(icon)
 
-        top_bar.addStretch()
+        texts = QVBoxLayout()
+        texts.setSpacing(0)
+        title = QLabel(APP_NAME)
+        title.setObjectName("brandTitle")
+        caption = QLabel(f"Local SLM Workbench  ·  v{APP_VERSION}")
+        caption.setObjectName("brandCaption")
+        texts.addWidget(title)
+        texts.addWidget(caption)
+        layout.addLayout(texts, 1)
+        return brand
 
-        self.clear_btn = QPushButton("🗑️ 清空對話")
-        self.clear_btn.setObjectName("secondaryButton")
-        self.clear_btn.clicked.connect(self.clear_chat)
-        top_bar.addWidget(self.clear_btn)
+    def _build_model_section(self, form: QVBoxLayout) -> None:
+        form.addWidget(make_section_header("模型"))
 
-        layout.addLayout(top_bar)
+        self.model_combo = QComboBox()
+        for label, model_id in PRESET_MODELS:
+            self.model_combo.addItem(label, model_id)
+        self.model_combo.currentIndexChanged.connect(self._on_model_selection_changed)
+        form.addWidget(self.model_combo)
 
-        # Chat History Browser
-        self.chat_browser = QTextBrowser()
-        self.chat_browser.setObjectName("chatBrowser")
-        self.chat_browser.setOpenExternalLinks(True)
-        layout.addWidget(self.chat_browser, stretch=1)
+        self.custom_model_input = QLineEdit()
+        self.custom_model_input.setPlaceholderText("organization/model-name")
+        self.custom_model_input.setVisible(False)
+        self.custom_model_input.textChanged.connect(self._update_model_availability)
+        form.addWidget(self.custom_model_input)
 
-        # Input Area Card
-        input_card = QFrame()
-        input_card.setObjectName("cardFrame")
-        ic_layout = QVBoxLayout(input_card)
-        ic_layout.setContentsMargins(10, 10, 10, 10)
-        ic_layout.setSpacing(8)
+        self.availability_indicator = StatusIndicator()
+        form.addWidget(self.availability_indicator)
 
-        # Multi-line input edit
-        self.input_edit = ChatInputEdit(self.send_message)
-        self.input_edit.setFixedHeight(75)
-        self.input_edit.setPlaceholderText("請輸入問題... (按 Enter 發送，Shift + Enter 換行)")
-        ic_layout.addWidget(self.input_edit)
+        self.load_button = QPushButton("載入模型")
+        self.load_button.setObjectName("primaryButton")
+        self.load_button.setMinimumHeight(34)
+        self.load_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.load_button.clicked.connect(self.start_loading_model)
+        form.addWidget(self.load_button)
 
-        # Action Buttons
-        btn_bar = QHBoxLayout()
+        self.load_progress = QProgressBar()
+        self.load_progress.setObjectName("loadProgress")
+        self.load_progress.setRange(0, 0)
+        self.load_progress.setTextVisible(False)
+        self.load_progress.setVisible(False)
+        form.addWidget(self.load_progress)
 
-        self.speed_label = QLabel("")
-        self.speed_label.setStyleSheet("color: #38bdf8; font-size: 11px;")
-        btn_bar.addWidget(self.speed_label)
+        self.load_detail = QLabel()
+        self.load_detail.setObjectName("statusBanner")
+        self.load_detail.setWordWrap(True)
+        self.load_detail.setVisible(False)
+        form.addWidget(self.load_detail)
 
-        btn_bar.addStretch()
+    def _build_device_section(self, form: QVBoxLayout) -> None:
+        form.addWidget(make_section_header("運算裝置"))
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("自動（優先使用 GPU）", "Auto")
+        self.device_combo.addItem("NVIDIA CUDA", "CUDA")
+        self.device_combo.addItem("CPU", "CPU")
+        form.addWidget(self.device_combo)
 
-        self.stop_btn = QPushButton("🛑 停止生成")
-        self.stop_btn.setObjectName("stopButton")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_generation)
-        btn_bar.addWidget(self.stop_btn)
+    def _build_generation_section(self, form: QVBoxLayout) -> None:
+        form.addWidget(make_section_header("生成參數"))
+        params = QFormLayout()
+        params.setHorizontalSpacing(14)
+        params.setVerticalSpacing(10)
+        params.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        params.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        params.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
 
-        self.send_btn = QPushButton("💬 發送 (Send)")
-        self.send_btn.setFixedHeight(34)
-        self.send_btn.clicked.connect(self.send_message)
-        btn_bar.addWidget(self.send_btn)
+        self.max_tokens_spin = QSpinBox()
+        self.max_tokens_spin.setRange(32, 4096)
+        self.max_tokens_spin.setSingleStep(64)
+        self.max_tokens_spin.setValue(512)
+        self.max_tokens_spin.setFixedWidth(86)
+        self.max_tokens_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+        params.addRow(make_field_label("最大長度", "單次回覆最多產生的 token 數"), self._wrap_field_right(self.max_tokens_spin))
 
-        ic_layout.addLayout(btn_bar)
-        layout.addWidget(input_card)
+        self.temp_spin = self._make_double_spin(0.0, 1.5, 0.05, 0.7)
+        params.addRow(make_field_label("Temperature", "越高越有創意，越低越穩定；0 為貪婪解碼"), self._wrap_field_right(self.temp_spin))
 
-        # Initial chat view
-        self.render_chat()
-        return chat_container
+        self.topp_spin = self._make_double_spin(0.1, 1.0, 0.05, 0.9)
+        params.addRow(make_field_label("Top-P", "核取樣機率門檻"), self._wrap_field_right(self.topp_spin))
 
-    def detect_hardware(self):
-        """Detect GPU and CPU capabilities."""
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            vram_gb = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1)
-            self.hw_label.setText(f"⚡ GPU: {gpu_name}\n💾 VRAM: {vram_gb} GB (CUDA 加速就緒)")
-        else:
-            self.hw_label.setText("💻 使用 CPU 模式 (未檢測到 CUDA GPU)")
+        self.rep_spin = self._make_double_spin(1.0, 2.0, 0.05, 1.15)
+        params.addRow(make_field_label("重複懲罰", "抑制小模型重複輸出相同片語"), self._wrap_field_right(self.rep_spin))
+        form.addLayout(params)
 
-    def get_current_model_id(self) -> str:
-        selected_data = self.model_combo.currentData()
-        if selected_data == "custom":
-            return self.custom_model_input.text().strip()
-        return selected_data
+    @staticmethod
+    def _wrap_field_right(widget: QWidget) -> QWidget:
+        wrap = QWidget()
+        layout = QHBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+        layout.addWidget(widget)
+        return wrap
 
-    def on_model_changed(self):
-        selected_data = self.model_combo.currentData()
-        self.custom_model_input.setVisible(selected_data == "custom")
-        self.update_model_status_display()
+    @staticmethod
+    def _make_double_spin(minimum: float, maximum: float, step: float, value: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setDecimals(2)
+        spin.setValue(value)
+        spin.setFixedWidth(86)
+        spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+        return spin
 
-    def update_model_status_display(self):
-        """Check if selected model exists in local folder and update UI state."""
-        model_id = self.get_current_model_id()
+    def _build_storage_footer(self) -> QWidget:
+        footer = QFrame()
+        footer.setObjectName("storageFooter")
+        layout = QVBoxLayout(footer)
+        layout.setContentsMargins(18, 12, 18, 14)
+        layout.setSpacing(6)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(make_section_header("模型存放目錄"))
+        top_row.addStretch(1)
+
+        open_button = QPushButton("📂 開啟")
+        open_button.setObjectName("linkButton")
+        open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_button.clicked.connect(self.open_models_directory)
+        top_row.addWidget(open_button)
+        layout.addLayout(top_row)
+
+        path_box = QFrame()
+        path_box.setObjectName("pathBox")
+        path_layout = QHBoxLayout(path_box)
+        path_layout.setContentsMargins(8, 6, 8, 6)
+
+        path_label = QLabel()
+        path_label.setObjectName("pathLabel")
+        path_label.setToolTip(str(self.models_dir))
+        path_str = str(self.models_dir)
+        path_label.setText(
+            path_label.fontMetrics().elidedText(path_str, Qt.TextElideMode.ElideMiddle, 280)
+        )
+        path_layout.addWidget(path_label)
+        layout.addWidget(path_box)
+        return footer
+
+    def _build_main_area(self) -> QWidget:
+        main = QWidget()
+        main.setObjectName("mainArea")
+        layout = QVBoxLayout(main)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        layout.addWidget(self._build_header())
+
+        self.chat_view = QTextBrowser()
+        self.chat_view.setObjectName("chatView")
+        self.chat_view.setOpenLinks(False)
+        self.chat_view.anchorClicked.connect(self._on_anchor_clicked)
+        self.chat_view.document().setDefaultStyleSheet(CHAT_DOCUMENT_CSS)
+        self.chat_view.document().setDocumentMargin(20)
+        layout.addWidget(self.chat_view, 1)
+
+        layout.addLayout(self._build_composer())
+        return main
+
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setObjectName("header")
+        header.setFixedHeight(60)
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(24, 0, 16, 0)
+        layout.setSpacing(12)
+
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        titles.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.header_title = QLabel("尚未載入模型")
+        self.header_title.setObjectName("headerTitle")
+        self.session_indicator = StatusIndicator()
+        titles.addWidget(self.header_title)
+        titles.addWidget(self.session_indicator)
+        layout.addLayout(titles)
+        layout.addStretch(1)
+
+        self.new_chat_button = QPushButton("新對話")
+        self.new_chat_button.setToolTip("清除目前對話 (Ctrl+N)")
+        self.new_chat_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_chat_button.clicked.connect(self.new_chat)
+        layout.addWidget(self.new_chat_button)
+        return header
+
+    def _build_composer(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(24, 8, 24, 18)
+
+        self.composer = QFrame()
+        self.composer.setObjectName("composer")
+        self.composer.setMaximumWidth(CHAT_MAX_WIDTH_PX + 40)
+        layout = QVBoxLayout(self.composer)
+        layout.setContentsMargins(14, 10, 10, 10)
+        layout.setSpacing(6)
+
+        self.input_edit = ChatInputEdit()
+        self.input_edit.submitted.connect(self.send_message)
+        self.input_edit.focus_changed.connect(self._on_composer_focus_changed)
+        layout.addWidget(self.input_edit)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        hint = QLabel("Enter 送出  ·  Shift+Enter 換行  ·  Esc 停止生成")
+        hint.setObjectName("hint")
+        actions.addWidget(hint)
+        actions.addStretch(1)
+
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setObjectName("dangerButton")
+        self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_button.clicked.connect(self.stop_generation)
+        self.stop_button.setVisible(False)
+        actions.addWidget(self.stop_button)
+
+        self.send_button = QPushButton("送出")
+        self.send_button.setObjectName("primaryButton")
+        self.send_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_button.clicked.connect(self.send_message)
+        actions.addWidget(self.send_button)
+        layout.addLayout(actions)
+
+        row.addStretch(1)
+        row.addWidget(self.composer, 10)
+        row.addStretch(1)
+        return row
+
+    def _build_status_bar(self) -> None:
+        bar = QStatusBar()
+        bar.setSizeGripEnabled(False)
+        self.perf_label = QLabel("— tok/s")
+        self.device_label = QLabel()
+        bar.addPermanentWidget(self.perf_label)
+        bar.addPermanentWidget(self.device_label)
+        self.setStatusBar(bar)
+
+    def _install_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Escape"), self, activated=self.stop_generation)
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self.new_chat)
+
+    # ------------------------------------------------------------- state
+    @property
+    def is_generating(self) -> bool:
+        return self.gen_worker is not None and self.gen_worker.isRunning()
+
+    def _selected_model_id(self) -> str:
+        data = self.model_combo.currentData()
+        return self.custom_model_input.text().strip() if data == "custom" else data
+
+    @staticmethod
+    def _short_name(model_id: str) -> str:
+        return model_id.split("/")[-1] if model_id else ""
+
+    def _on_model_selection_changed(self) -> None:
+        is_custom = self.model_combo.currentData() == "custom"
+        self.custom_model_input.setVisible(is_custom)
+        if is_custom:
+            self.custom_model_input.setFocus()
+        self._update_model_availability()
+
+    def _update_model_availability(self) -> None:
+        model_id = self._selected_model_id()
+        busy = self._is_loading or self.is_generating
         if not model_id:
-            self.load_status_label.setText("請選擇或輸入模型 ID")
-            self.load_model_btn.setText("🚀 載入模型")
+            self.availability_indicator.set_state("idle", "請輸入 Hugging Face Repo ID")
+            self.load_button.setEnabled(False)
             return
 
-        is_downloaded = is_model_downloaded_locally(model_id, self.models_dir)
-        folder_name = model_id.split("/")[-1]
-
-        if is_downloaded:
-            self.load_status_label.setText(f"💾 本機已存在 ({folder_name})，免連網直接載入")
-            self.load_status_label.setStyleSheet("color: #4ade80; font-size: 11px;")
-            self.load_model_btn.setText(f"⚡ 直接載入本地模型 ({folder_name})")
+        self.load_button.setEnabled(not busy)
+        if is_model_downloaded_locally(model_id, self.models_dir):
+            self.availability_indicator.set_state("ready", "已下載 · 可離線載入")
+            self.load_button.setText("載入模型")
         else:
-            self.load_status_label.setText(f"🌐 尚未下載至本地，首次載入將自動下載至 ./models/{folder_name}")
-            self.load_status_label.setStyleSheet("color: #38bdf8; font-size: 11px;")
-            self.load_model_btn.setText(f"📥 下載並載入模型 ({folder_name})")
+            self.availability_indicator.set_state("remote", "尚未下載 · 首次載入將自動下載")
+            self.load_button.setText("下載並載入")
+        if self.model is not None and model_id == self.loaded_model_id:
+            self.load_button.setText("重新載入")
 
-    def open_models_directory(self):
-        """Open the local models directory in Windows Explorer."""
+    def _set_session_state(self, state: str) -> None:
+        indicator = {
+            "idle": ("idle", "未載入"),
+            "loading": ("busy", "載入中…"),
+            "ready": ("ready", f"就緒  ·  {self.device_summary}"),
+            "generating": ("busy", "生成中…"),
+            "error": ("error", "載入失敗"),
+        }[state]
+        self.session_indicator.set_state(*indicator)
+
+        has_model = self.model is not None
+        generating = state == "generating"
+        busy = generating or state == "loading"
+        self.send_button.setEnabled(has_model and not busy)
+        self.send_button.setVisible(not generating)
+        self.stop_button.setVisible(generating)
+        self.new_chat_button.setEnabled(not generating)
+        self.model_combo.setEnabled(not busy)
+        self.custom_model_input.setEnabled(not busy)
+        self.device_combo.setEnabled(not busy)
+        self.input_edit.setPlaceholderText("輸入訊息…" if has_model else "請先從左側載入模型")
+        self._update_model_availability()
+
+    def _on_composer_focus_changed(self, focused: bool) -> None:
+        self.composer.setProperty("focused", focused)
+        self.composer.style().unpolish(self.composer)
+        self.composer.style().polish(self.composer)
+
+    def _update_device_label(self) -> None:
+        if not self._gpu_name:
+            self.device_label.setText("CPU 模式")
+            return
+        used_gb = torch.cuda.memory_allocated(0) / 1024**3
+        self.device_label.setText(f"{self._gpu_name}  ·  VRAM {used_gb:.1f} / {self._gpu_total_gb:.1f} GB")
+
+    # ---------------------------------------------------------- rendering
+    def _content_width(self) -> int:
+        available = self.chat_view.viewport().width() - CHAT_SIDE_PADDING_PX
+        return max(360, min(CHAT_MAX_WIDTH_PX, available))
+
+    def _refresh_chat(self, force_scroll: bool = False) -> None:
+        if not self.messages and self.streaming_text is None:
+            inner = render_welcome(self._short_name(self.loaded_model_id) if self.model else "")
+        else:
+            blocks = list(self._message_html)
+            if self.streaming_text is not None:
+                pending = ChatMessage("assistant", self.streaming_text)
+                blocks.append(render_message(len(self.messages), pending, streaming=True))
+            inner = "".join(blocks)
+
+        scrollbar = self.chat_view.verticalScrollBar()
+        previous = scrollbar.value()
+        at_bottom = previous >= scrollbar.maximum() - 32
+        self.chat_view.setHtml(wrap_document(inner, self._content_width()))
+        scrollbar.setValue(scrollbar.maximum() if force_scroll or at_bottom else previous)
+
+    def _append_message(self, message: ChatMessage) -> None:
+        self.messages.append(message)
+        self._message_html.append(render_message(len(self.messages) - 1, message))
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._resize_timer.start()
+
+    def _on_anchor_clicked(self, url: QUrl) -> None:
+        scheme = url.scheme()
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(self.models_dir))
-            else:
-                subprocess.Popen(["xdg-open", str(self.models_dir)])
-        except Exception as e:
-            QMessageBox.warning(self, "開啟目錄失敗", str(e))
+            if scheme == "prompt":
+                _, prompt = SUGGESTIONS[int(url.path())]
+                self.input_edit.setPlainText(prompt)
+                self.input_edit.moveCursor(self.input_edit.textCursor().MoveOperation.End)
+                self.input_edit.setFocus()
+            elif scheme == "copy":
+                QApplication.clipboard().setText(self.messages[int(url.path())].content)
+                self.statusBar().showMessage("已複製到剪貼簿", 2000)
+            elif scheme in ("http", "https"):
+                QDesktopServices.openUrl(url)
+        except (ValueError, IndexError):
+            logger.warning("Ignoring invalid chat link: %s", url.toString())
 
-    def get_welcome_html(self) -> str:
-        return """
-        <div style="text-align: center; margin-top: 30px; margin-bottom: 20px;">
-            <h2 style="color: #38bdf8; margin-bottom: 6px;">歡迎使用 SmolLM 本地小語言模型對話工具</h2>
-            <p style="color: #94a3b8; font-size: 13px;">
-                本程式由 Hugging Face Transformers 與 PyTorch 本地驅動，具備隱私、免聯網推論與 GPU 加速能力。
-            </p>
-            <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 15px; margin: 20px auto; max-width: 620px; text-align: left;">
-                <b style="color: #f8fafc;">💡 核心設計特點：</b><br>
-                <ol style="color: #cbd5e1; margin-top: 8px; line-height: 1.8;">
-                    <li>預設內定模型為 <b>SmolLM2-1.7B-Instruct</b>，品質與推理能力優秀。</li>
-                    <li><b>直接持久化保存在執行檔旁的 <code>models/</code> 目錄</b>，只要下載過一次，往後皆可秒速離線載入！</li>
-                    <li>支援即時 Token 流式輸出、即時中途停止、硬體監控與防複讀懲罰機制。</li>
-                </ol>
-            </div>
-        </div>
-        """
+    # ------------------------------------------------------- model loading
+    def _auto_load_default_model(self) -> None:
+        if self.model is None and not self._is_loading and self._selected_model_id() == DEFAULT_MODEL_ID:
+            if is_model_downloaded_locally(DEFAULT_MODEL_ID, self.models_dir):
+                logger.info("Default model found locally; auto-loading.")
+                self.start_loading_model()
 
-    def render_chat(self, streaming_response: Optional[str] = None):
-        """Render complete, valid HTML chat bubbles without tag leakage."""
-        if not self.conversation_history and streaming_response is None:
-            self.chat_browser.setHtml(self.get_welcome_html())
-            return
+    def _release_model(self) -> None:
+        self.model = None
+        self.tokenizer = None
+        self.loaded_model_id = ""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        html_body = []
-        for msg in self.conversation_history:
-            role = msg["role"]
-            content = html.escape(msg["content"]).replace("\n", "<br>")
-            if role == "user":
-                html_body.append(f"""
-                <div style="margin: 12px 0; text-align: right;">
-                    <div style="display: inline-block; background: #2563eb; color: #ffffff; padding: 10px 16px; border-radius: 12px; max-width: 80%; text-align: left;">
-                        <div style="font-weight: bold; font-size: 11px; margin-bottom: 4px; color: #bfdbfe;">👤 提問者 (You)</div>
-                        <div style="font-size: 13px; line-height: 1.5;">{content}</div>
-                    </div>
-                </div>
-                """)
-            elif role == "assistant":
-                html_body.append(f"""
-                <div style="margin: 12px 0; text-align: left;">
-                    <div style="display: inline-block; background-color: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 12px 16px; border-radius: 12px; max-width: 85%; text-align: left;">
-                        <div style="font-weight: bold; font-size: 11px; margin-bottom: 5px; color: #38bdf8;">🤖 SmolLM 助手</div>
-                        <div style="font-size: 13px; line-height: 1.6;">{content}</div>
-                    </div>
-                </div>
-                """)
-
-        if streaming_response is not None:
-            content = html.escape(streaming_response).replace("\n", "<br>")
-            html_body.append(f"""
-            <div style="margin: 12px 0; text-align: left;">
-                <div style="display: inline-block; background-color: #1e293b; border: 1px solid #38bdf8; color: #f8fafc; padding: 12px 16px; border-radius: 12px; max-width: 85%; text-align: left;">
-                    <div style="font-weight: bold; font-size: 11px; margin-bottom: 5px; color: #38bdf8;">🤖 SmolLM 助手 (生成中...)</div>
-                    <div style="font-size: 13px; line-height: 1.6;">{content}</div>
-                </div>
-            </div>
-            """)
-
-        full_html = f"""
-        <html>
-        <body style="background-color: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; margin: 8px;">
-            {''.join(html_body)}
-        </body>
-        </html>
-        """
-
-        sb = self.chat_browser.verticalScrollBar()
-        was_at_bottom = sb.value() >= (sb.maximum() - 40)
-
-        self.chat_browser.setHtml(full_html)
-
-        if was_at_bottom or streaming_response is not None:
-            sb.setValue(sb.maximum())
-
-    def start_loading_model(self):
-        model_id = self.get_current_model_id()
+    def start_loading_model(self) -> None:
+        model_id = self._selected_model_id()
         if not model_id:
-            QMessageBox.warning(self, "請輸入模型 ID", "請在輸入框中輸入 Hugging Face 倉庫 ID，例如 HuggingFaceTB/SmolLM2-1.7B-Instruct")
+            QMessageBox.warning(self, "缺少模型 ID", "請輸入 Hugging Face Repo ID，例如 HuggingFaceTB/SmolLM2-1.7B-Instruct")
+            return
+        if self._is_loading or self.is_generating:
             return
 
-        device_choice = self.device_combo.currentData()
+        self._release_model()
+        self._is_loading = True
+        self._loading_model_id = model_id
+        self.load_progress.setVisible(True)
+        self.load_detail.setVisible(True)
+        self.load_detail.setText("準備中…")
+        self.header_title.setText(self._short_name(model_id))
+        self._set_session_state("loading")
 
-        # UI state during load
-        self.load_model_btn.setEnabled(False)
-        self.load_progress_bar.setVisible(True)
-        self.load_status_label.setText(f"處理中: {model_id}...")
-        self.chat_header_status.setText(f"⏳ 正在載入模型: {model_id}，請稍候...")
-
-        # Worker
-        self.loader_worker = ModelLoaderWorker(model_id, device_choice, self.models_dir)
-        self.loader_worker.progress_signal.connect(self.on_load_progress)
-        self.loader_worker.finished_signal.connect(self.on_load_finished)
+        self.loader_worker = ModelLoaderWorker(model_id, self.device_combo.currentData(), self.models_dir)
+        self.loader_worker.progress_signal.connect(self.load_detail.setText)
+        self.loader_worker.finished_signal.connect(self._on_load_finished)
         self.loader_worker.start()
 
-    def on_load_progress(self, msg: str):
-        self.load_status_label.setText(msg)
-
-    def on_load_finished(self, success: bool, message: str, tokenizer, model, local_path: str):
-        self.load_model_btn.setEnabled(True)
-        self.load_progress_bar.setVisible(False)
+    def _on_load_finished(self, success: bool, message: str, tokenizer, model, local_path: str) -> None:
+        self._is_loading = False
+        self.load_progress.setVisible(False)
 
         if success:
-            self.tokenizer = tokenizer
-            self.model = model
-            self.current_model_id = self.get_current_model_id()
-            self.current_local_path = local_path
-
-            self.load_status_label.setText(f"✅ {message}\n路徑: {Path(local_path).name}")
-            self.chat_header_status.setText(f"🟢 已就緒: {self.current_model_id} (本機持久化)")
-
-            # Update hardware card with current memory
-            if torch.cuda.is_available() and next(model.parameters()).is_cuda:
-                allocated = round(torch.cuda.memory_allocated(0) / (1024**3), 2)
-                self.hw_label.setText(f"⚡ GPU: {torch.cuda.get_device_name(0)}\n📊 模型佔用 VRAM: {allocated} GB")
-
-            self.update_model_status_display()
-            QMessageBox.information(
-                self,
-                "模型載入完成",
-                f"模型已就緒並儲存於本機：\n{local_path}\n\n下次啟動將直接讀取本機檔案，無需重複下載！"
-            )
+            self.tokenizer, self.model = tokenizer, model
+            self.loaded_model_id = self._loading_model_id
+            param = next(model.parameters())
+            self.device_summary = f"{param.device.type.upper()} · {str(param.dtype).replace('torch.', '')}"
+            self.load_detail.setText(f"已從本機載入：{Path(local_path).name}")
+            self.header_title.setText(self._short_name(self.loaded_model_id))
+            self._set_session_state("ready")
+            self.statusBar().showMessage(f"模型已載入：{self.loaded_model_id}", 5000)
+            self._refresh_chat()
+            self.input_edit.setFocus()
         else:
-            self.load_status_label.setText("❌ 載入失敗")
-            self.chat_header_status.setText("🔴 模型載入失敗")
-            QMessageBox.critical(self, "模型載入失敗", f"無法載入模型，錯誤訊息：\n{message}")
+            logger.error("Model load failed: %s", message)
+            self.load_detail.setText(message)
+            self.header_title.setText("尚未載入模型")
+            self._set_session_state("error")
+            QMessageBox.critical(self, "模型載入失敗", message)
+        self._update_device_label()
 
-    def send_message(self):
-        if self.model is None or self.tokenizer is None:
-            QMessageBox.warning(self, "模型尚未載入", "請先點選左側面板的載入按鈕以載入語言模型！")
+    def open_models_directory(self) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(self.models_dir))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(self.models_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(self.models_dir)])
+        except OSError as exc:
+            logger.exception("Failed to open models directory")
+            QMessageBox.warning(self, "無法開啟資料夾", str(exc))
+
+    # ---------------------------------------------------------- generation
+    def send_message(self) -> None:
+        if self.model is None or self.tokenizer is None or self.is_generating or self._is_loading:
             return
-
-        user_text = self.input_edit.toPlainText().strip()
-        if not user_text:
+        text = self.input_edit.toPlainText().strip()
+        if not text:
             return
 
         self.input_edit.clear()
+        self._append_message(ChatMessage("user", text))
 
-        # Add user message to conversation history
-        self.conversation_history.append({"role": "user", "content": user_text})
-        self.render_chat()
+        payload: list[dict[str, str]] = []
+        system_prompt = self.system_prompt_edit.toPlainText().strip()
+        if system_prompt:
+            payload.append({"role": "system", "content": system_prompt})
+        payload.extend(
+            {"role": m.role, "content": m.content} for m in self.messages if m.role in ("user", "assistant")
+        )
 
-        # Build messages payload
-        messages = []
-        sys_prompt = self.system_prompt_edit.toPlainText().strip()
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
-
-        for msg in self.conversation_history:
-            messages.append(msg)
-
-        # UI buttons state
-        self.send_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.speed_label.setText("⚡ 正在思考中...")
-
-        self.current_streaming_text = ""
-
-        # Launch generation worker
+        self.streaming_text = ""
+        self._stop_requested = False
         self.gen_worker = TextGeneratorWorker(
             tokenizer=self.tokenizer,
             model=self.model,
-            messages=messages,
+            messages=payload,
             max_new_tokens=self.max_tokens_spin.value(),
             temperature=self.temp_spin.value(),
             top_p=self.topp_spin.value(),
             repetition_penalty=self.rep_spin.value(),
         )
-        self.gen_worker.token_signal.connect(self.on_token_received)
-        self.gen_worker.finished_signal.connect(self.on_generation_finished)
-        self.gen_worker.error_signal.connect(self.on_generation_error)
+        self.gen_worker.token_signal.connect(self._on_token)
+        self.gen_worker.finished_signal.connect(self._on_generation_finished)
+        self.gen_worker.error_signal.connect(self._on_generation_error)
         self.gen_worker.start()
+        self._set_session_state("generating")
+        self._refresh_chat(force_scroll=True)
 
-    def on_token_received(self, token: str):
-        self.current_streaming_text += token
-        self.render_chat(streaming_response=self.current_streaming_text)
+    def _on_token(self, token: str) -> None:
+        if self.streaming_text is None:
+            return
+        self.streaming_text += token
+        self._refresh_chat()
 
-    def on_generation_finished(self, full_response: str, elapsed: float, token_count: int):
-        self.conversation_history.append({"role": "assistant", "content": full_response})
-        self.current_streaming_text = ""
-        self.render_chat()
+    def _on_generation_finished(self, full_response: str, elapsed: float, token_count: int) -> None:
+        self.streaming_text = None
+        speed = token_count / elapsed if elapsed > 0 else 0.0
+        meta = f"{token_count} tokens  ·  {speed:.1f} tok/s  ·  {elapsed:.1f}s"
+        if self._stop_requested:
+            meta += "  ·  已中止"
+        if full_response.strip():
+            self._append_message(ChatMessage("assistant", full_response, meta))
+        self.perf_label.setText(f"{speed:.1f} tok/s")
+        self._set_session_state("ready")
+        self._refresh_chat(force_scroll=True)
+        self.input_edit.setFocus()
 
-        speed = round(token_count / elapsed, 1) if elapsed > 0 else 0
-        self.speed_label.setText(f"⚡ 推論速度: {speed} tokens/s ({token_count} 字元 / {round(elapsed, 2)}秒)")
+    def _on_generation_error(self, error_message: str) -> None:
+        logger.error("Generation failed: %s", error_message)
+        self.streaming_text = None
+        self._append_message(ChatMessage("error", f"生成失敗：{error_message}"))
+        self._set_session_state("ready")
+        self._refresh_chat(force_scroll=True)
 
-        self.send_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-
-    def on_generation_error(self, err_msg: str):
-        self.conversation_history.append({"role": "assistant", "content": f"[錯誤: {err_msg}]"})
-        self.current_streaming_text = ""
-        self.render_chat()
-        self.send_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.speed_label.setText("")
-
-    def stop_generation(self):
-        if self.gen_worker and self.gen_worker.isRunning():
+    def stop_generation(self) -> None:
+        if self.is_generating and self.gen_worker is not None:
+            self._stop_requested = True
             self.gen_worker.request_stop()
-            self.speed_label.setText("🛑 使用者中止生成")
+            self.statusBar().showMessage("正在停止生成…", 2000)
 
-    def clear_chat(self):
-        self.conversation_history.clear()
-        self.current_streaming_text = ""
-        self.render_chat()
-        self.speed_label.setText("")
+    def new_chat(self) -> None:
+        if self.is_generating:
+            return
+        self.messages.clear()
+        self._message_html.clear()
+        self.perf_label.setText("— tok/s")
+        self._refresh_chat()
+        self.input_edit.setFocus()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.is_generating and self.gen_worker is not None:
+            self.gen_worker.request_stop()
+            self.gen_worker.wait(5000)
+        if self.loader_worker is not None and self.loader_worker.isRunning():
+            self.loader_worker.wait(5000)
+        super().closeEvent(event)
 
 
-def main():
+def _configure_logging() -> None:
+    log_dir = get_base_dir() / "logs"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_dir / "smollm_studio.log", encoding="utf-8"))
+    except OSError:
+        pass  # Read-only install location: fall back to stream logging only.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+
+def main() -> None:
+    _configure_logging()
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_THEME)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setStyle("Fusion")
+    app.setFont(QFont(UI_FONT_FAMILY, 10))
+    app.setStyleSheet(APP_STYLESHEET)
 
-    font = QFont("Segoe UI", 10)
-    app.setFont(font)
-
-    window = SmolLMAssistantWindow()
+    window = MainWindow()
     window.show()
     sys.exit(app.exec())
 

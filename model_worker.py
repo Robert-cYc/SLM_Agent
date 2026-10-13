@@ -96,15 +96,15 @@ class ModelLoaderWorker(QThread):
             already_downloaded = is_model_downloaded_locally(self.model_id, self.models_dir)
 
             if already_downloaded:
-                self.progress_signal.emit(f"本地已存在模型檔案，直接從本機載入：\n{local_model_path.name}")
+                self.progress_signal.emit(f"✓ 本地模型已就緒\n目錄：models/{local_model_path.name}\n正在載入至記憶體…")
             else:
-                self.progress_signal.emit(f"正在從 Hugging Face 下載 {self.model_id} 至本地目錄：\n{local_model_path} ...")
+                self.progress_signal.emit(f"⬇ 正在下載模型權重…\n{self.model_id}\n存放至：models/{local_model_path.name}")
                 # Download to local directory directly
                 snapshot_download(
                     repo_id=self.model_id,
                     local_dir=str(local_model_path),
                 )
-                self.progress_signal.emit(f"下載完成！模型已保存在本地：{local_model_path.name}")
+                self.progress_signal.emit(f"✓ 下載完成！\n模型已保存在：models/{local_model_path.name}")
 
             # Determine device
             if self.device_choice == "CUDA" and torch.cuda.is_available():

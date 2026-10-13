@@ -55,3 +55,74 @@ def test_is_model_downloaded_locally(tmp_path: Path):
     (target / "model.safetensors").write_bytes(b"dummy")
 
     assert is_model_downloaded_locally(model_id, tmp_path)
+
+
+def test_plain_text_to_html():
+    from chat_renderer import plain_text_to_html
+
+    raw = "Hello & welcome <world>\nLine 2"
+    result = plain_text_to_html(raw)
+    assert "&amp;" in result
+    assert "&lt;world&gt;" in result
+    assert "<br>" in result
+    assert "<p>" in result and "</p>" in result
+
+
+def test_markdown_to_html():
+    from chat_renderer import markdown_to_html
+
+    md = "# Title\n\n```python\nprint('hi')\n```"
+    html = markdown_to_html(md)
+    assert "Title" in html
+    assert '<pre><code class="block">' in html
+
+
+def test_markdown_sanitization():
+    from chat_renderer import markdown_to_html
+
+    # Raw script or dangerous tag should not be passed through as executable HTML
+    dangerous = '<script>alert("hack")</script>'
+    html = markdown_to_html(dangerous)
+    # The preprocessor deregistration ensures raw html blocks are escaped
+    assert "<script>" not in html
+
+
+def test_render_message_user_and_assistant():
+    from chat_renderer import ChatMessage, render_message, STREAMING_CURSOR
+
+    # User message
+    msg_user = ChatMessage(role="user", content="Hello!")
+    html_user = render_message(0, msg_user)
+    assert "Hello!" in html_user
+    assert "你" in html_user
+
+    # Assistant message (non-streaming)
+    msg_asst = ChatMessage(role="assistant", content="Hi there!", meta="25.4 tok/s")
+    html_asst = render_message(1, msg_asst, streaming=False)
+    assert "Hi there!" in html_asst
+    assert "SmolLM" in html_asst
+    assert "25.4 tok/s" in html_asst
+    assert 'href="copy:1"' in html_asst
+
+    # Assistant message (streaming)
+    html_stream = render_message(1, msg_asst, streaming=True)
+    assert STREAMING_CURSOR in html_stream
+
+
+def test_render_welcome():
+    from chat_renderer import render_welcome, SUGGESTIONS
+
+    welcome = render_welcome("SmolLM2-1.7B-Instruct")
+    assert "SmolLM2-1.7B-Instruct" in welcome
+    assert "今天想聊些什麼？" in welcome
+    for i, (title, _) in enumerate(SUGGESTIONS):
+        assert f'href="prompt:{i}"' in welcome
+
+
+def test_wrap_document():
+    from chat_renderer import wrap_document
+
+    doc = wrap_document("<p>Test</p>", width_px=700)
+    assert 'width="700"' in doc
+    assert "<p>Test</p>" in doc
+

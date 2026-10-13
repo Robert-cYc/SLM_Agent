@@ -87,9 +87,11 @@ python -m pytest test_app.py -v
 ## 📂 專案檔案結構
 
 - [`Run_App.bat`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/Run_App.bat)：根目錄一鍵捷徑啟動腳本。
-- [`app.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/app.py)：GUI 主程式與對話介面邏輯。
+- [`app.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/app.py)：GUI 主程式與對話介面邏輯（SmolLM Studio）。
+- [`chat_renderer.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/chat_renderer.py)：專業 Markdown 與對話氣泡 HTML 渲染器（支援語法高亮、表格、防 XSS 轉義與一鍵複製）。
+- [`widgets.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/widgets.py)：自訂動態高度輸入框（Shift+Enter 換行）、狀態指示燈與向量 Icon 繪製組件。
 - [`model_worker.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/model_worker.py)：模型下載、載入與串流推論背景執行緒。
-- [`styles.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/styles.py)：現代深色風格 QSS 樣式表。
+- [`styles.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/styles.py)：現代深色風格 QSS 樣式表與 Design Tokens。
 - [`build_exe.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/build_exe.py)：PyInstaller 自動打包腳本。
-- [`test_app.py`](file:///g:/My%20Drive/Google%20Antigravity/Coding/SLM_Agent/test_app.py)：單元測試。
+- [`test_app.py`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/test_app.py)：單元測試套件。
 - [`requirements.txt`](file:///g:/我的雲端硬碟/Google%20Antigravity/Coding/SLM_Agent/requirements.txt)：專案相依套件清單。
