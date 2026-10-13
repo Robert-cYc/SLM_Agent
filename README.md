@@ -7,14 +7,17 @@
 
 ## ✨ 核心特色
 
-1. **一鍵下載與載入 Hugging Face 小語言模型 (SLM)**：
-   - 預設整合 Hugging Face 官方 SmolLM 系列：
-     - `HuggingFaceTB/SmolLM2-135M-Instruct`（超輕量 135M，~270MB，秒下載秒載入，低配電腦也能高速運行）
-     - `HuggingFaceTB/SmolLM2-360M-Instruct`（輕量 360M，~720MB，平衡度佳）
-     - `HuggingFaceTB/SmolLM2-1.7B-Instruct`（高品質 1.7B，~3.4GB）
+1. **預設內定模型 SmolLM2-1.7B-Instruct 與持久化本地儲存**：
+   - **預設模型**：`HuggingFaceTB/SmolLM2-1.7B-Instruct`（高品質 1.7B，~3.4GB，推理與對話能力全面）。
+   - **持久化存放**：模型下載後直接儲存於**執行檔所在目錄旁邊的 `models/` 資料夾**，免去預設快取路徑的混淆。
+   - **離線秒速載入**：只要下載過一次，往後啟動時自動偵測本地權重，**100% 離線直接讀取，無需重複下載**！
+   - 提供「📂 開啟本機模型目錄」按鈕，可直接在檔案總管中查看下載的權重。
+   - 同時支援其他選配模型：
+     - `HuggingFaceTB/SmolLM2-135M-Instruct`（超輕量 135M，~270MB，秒下載秒載入）
+     - `HuggingFaceTB/SmolLM2-360M-Instruct`（輕量 360M，~720MB）
      - `HuggingFaceTB/SmolLM3-3B`（最新 SmolLM3 3B 模型，~6GB）
-     - `Qwen/Qwen2.5-0.5B-Instruct`（阿里千問 0.5B，繁簡中文能力佳）
-   - **支援自訂模型**：可自由輸入任何 Hugging Face Repo ID。
+     - `Qwen/Qwen2.5-0.5B-Instruct`（阿里千問 0.5B，中文表現佳）
+     - **自訂模型**：可自由輸入任何 Hugging Face Repo ID。
 2. **自動硬體檢測與加速**：
    - 自動檢測 NVIDIA GPU（CUDA）並顯示顯卡型號與 VRAM 佔用情況。
    - 若無獨立顯卡，自動優雅降級為 CPU 運行模式。
@@ -43,7 +46,7 @@ Run_App.bat
 dist\SmolLMAssistant\SmolLMAssistant.exe
 ```
 
-> ⚠️ **注意**：請務必開啟 **`dist`** 資料夾內的執行檔（或點擊 `Run_App.bat`），**切勿**點擊 `build` 資料夾（`build` 僅為編譯過程中的暫存暫存目錄，不包含執行所需之 DLL 模組）。
+> ⚠️ **注意**：請務必開啟 **`dist`** 資料夾內的執行檔（或點擊 `Run_App.bat`），勿點擊已自動清理的 `build` 暫存目錄。
 
 ---
 
