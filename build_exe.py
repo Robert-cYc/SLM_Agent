@@ -5,6 +5,7 @@ Builds a standalone Windows executable.
 
 import sys
 import subprocess
+import shutil
 from pathlib import Path
 
 # Fix Windows console encoding for UTF-8
@@ -16,33 +17,57 @@ if sys.platform.startswith("win"):
         pass
 
 
+def kill_existing_process():
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "SmolLMAssistant.exe"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
 def build():
     print("=" * 60)
     print("[*] Starting PyInstaller build for SmolLM Assistant...")
     print("=" * 60)
 
+    kill_existing_process()
+
     project_dir = Path(__file__).parent.resolve()
     entry_point = project_dir / "app.py"
 
-    # PyInstaller arguments
-    # Using --onedir is strongly recommended for PyTorch/Transformers to avoid
-    # massive extraction latency at every startup.
+    # Clean previous build directories to prevent stale cache errors
+    for folder in ["build", "dist"]:
+        p = project_dir / folder
+        if p.exists():
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+
     args = [
         sys.executable,
         "-m",
         "PyInstaller",
+        "--clean",
         "--noconfirm",
         "--name=SmolLMAssistant",
         "--windowed",  # No console window (GUI app)
         "--onedir",
-        # Collect all assets and submodules
+        # Collect Hugging Face and PyTorch dependencies
         "--collect-all=transformers",
         "--collect-all=tokenizers",
         "--collect-all=huggingface_hub",
         "--collect-all=safetensors",
         "--collect-all=torch",
-        "--collect-all=PyQt6",
-        # Hidden imports
+        # Hidden imports for GUI and core libraries
+        "--hidden-import=PyQt6",
+        "--hidden-import=PyQt6.QtCore",
+        "--hidden-import=PyQt6.QtGui",
+        "--hidden-import=PyQt6.QtWidgets",
         "--hidden-import=regex",
         "--hidden-import=tqdm",
         "--hidden-import=requests",
@@ -63,7 +88,7 @@ def build():
     if result.returncode == 0:
         exe_path = project_dir / "dist" / "SmolLMAssistant" / "SmolLMAssistant.exe"
         print("=" * 60)
-        print(f"[+] Build successfully finished!")
+        print("[+] Build successfully finished!")
         print(f"Executable location: {exe_path}")
         print("=" * 60)
     else:

@@ -5,6 +5,7 @@ SmolLM Desktop AI Assistant - Modern PyQt6 GUI
 import sys
 import os
 import html
+from typing import Optional
 import torch
 
 from PyQt6.QtWidgets import (
@@ -19,7 +20,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QTextBrowser,
-    QSlider,
     QDoubleSpinBox,
     QSpinBox,
     QFrame,
@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QKeyEvent
 
 from styles import DARK_THEME
@@ -72,7 +72,7 @@ class SmolLMAssistantWindow(QMainWindow):
         self.model = None
         self.current_model_id = ""
         self.conversation_history = []
-        self.current_assistant_text = ""
+        self.current_streaming_text = ""
         self.loader_worker = None
         self.gen_worker = None
 
@@ -80,14 +80,12 @@ class SmolLMAssistantWindow(QMainWindow):
         self.detect_hardware()
 
     def init_ui(self):
-        # Central widget and main horizontal layout
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(14, 14, 14, 14)
         main_layout.setSpacing(14)
 
-        # Splitter to allow resizing sidebar vs chat area
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(4)
 
@@ -171,7 +169,7 @@ class SmolLMAssistantWindow(QMainWindow):
         # Progress bar
         self.load_progress_bar = QProgressBar()
         self.load_progress_bar.setVisible(False)
-        self.load_progress_bar.setRange(0, 0)  # Indeterminate animation
+        self.load_progress_bar.setRange(0, 0)
         mc_layout.addWidget(self.load_progress_bar)
 
         # Loading Status label
@@ -222,13 +220,23 @@ class SmolLMAssistantWindow(QMainWindow):
         topp_box.addWidget(self.topp_spin)
         p_layout.addLayout(topp_box)
 
+        # Repetition Penalty (prevents infinite repetition loops)
+        rep_box = QHBoxLayout()
+        rep_box.addWidget(QLabel("重複懲罰 (Repetition Penalty):"))
+        self.rep_spin = QDoubleSpinBox()
+        self.rep_spin.setRange(1.0, 2.0)
+        self.rep_spin.setValue(1.15)
+        self.rep_spin.setSingleStep(0.05)
+        rep_box.addWidget(self.rep_spin)
+        p_layout.addLayout(rep_box)
+
         # System Prompt
         sys_label = QLabel("系統提示詞 (System Prompt):")
         p_layout.addWidget(sys_label)
         self.system_prompt_edit = QPlainTextEdit()
         self.system_prompt_edit.setFixedHeight(70)
         self.system_prompt_edit.setPlainText(
-            "You are a helpful and intelligent AI assistant. Answer clearly and concisely."
+            "You are SmolLM, a friendly, helpful, and concise AI assistant developed by Hugging Face."
         )
         p_layout.addWidget(self.system_prompt_edit)
 
@@ -310,8 +318,8 @@ class SmolLMAssistantWindow(QMainWindow):
         ic_layout.addLayout(btn_bar)
         layout.addWidget(input_card)
 
-        # Render initial greeting
-        self.render_initial_welcome()
+        # Initial chat view
+        self.render_chat()
         return chat_container
 
     def detect_hardware(self):
@@ -327,9 +335,9 @@ class SmolLMAssistantWindow(QMainWindow):
         selected_data = self.model_combo.currentData()
         self.custom_model_input.setVisible(selected_data == "custom")
 
-    def render_initial_welcome(self):
-        welcome_html = """
-        <div style="text-align: center; margin-top: 40px; margin-bottom: 20px;">
+    def get_welcome_html(self) -> str:
+        return """
+        <div style="text-align: center; margin-top: 30px; margin-bottom: 20px;">
             <h2 style="color: #38bdf8; margin-bottom: 6px;">歡迎使用 SmolLM 本地小語言模型對話工具</h2>
             <p style="color: #94a3b8; font-size: 13px;">
                 本程式由 Hugging Face Transformers 與 PyTorch 本地驅動，具備隱私、免聯網推論與 GPU 加速能力。
@@ -344,43 +352,62 @@ class SmolLMAssistantWindow(QMainWindow):
             </div>
         </div>
         """
-        self.chat_browser.setHtml(welcome_html)
 
-    def append_message_to_html(self, role: str, text: str, is_partial: bool = False):
-        """Append or update a chat bubble in the chat browser."""
-        safe_text = html.escape(text).replace("\n", "<br>")
+    def render_chat(self, streaming_response: Optional[str] = None):
+        """Render complete, valid HTML chat bubbles without tag leakage."""
+        if not self.conversation_history and streaming_response is None:
+            self.chat_browser.setHtml(self.get_welcome_html())
+            return
 
-        if role == "user":
-            bubble_html = f"""
-            <div style="display: flex; justify-content: flex-end; margin: 12px 0;">
-                <div style="background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #ffffff; padding: 10px 16px; border-radius: 12px; max-width: 80%; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
-                    <div style="font-weight: bold; font-size: 11px; margin-bottom: 4px; color: #bfdbfe;">👤 提問者 (You)</div>
-                    <div style="font-size: 13px; line-height: 1.5;">{safe_text}</div>
-                </div>
-            </div>
-            """
-            self.chat_browser.append(bubble_html)
-
-        elif role == "assistant":
-            if is_partial:
-                # Update partial assistant response in real time
-                self.chat_browser.moveCursor(self.chat_browser.textCursor().MoveOperation.End)
-                # Overwrite or append token
-                self.chat_browser.insertPlainText(text)
-            else:
-                bubble_html = f"""
-                <div style="display: flex; justify-content: flex-start; margin: 12px 0;">
-                    <div style="background-color: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 12px 16px; border-radius: 12px; max-width: 85%;">
-                        <div style="font-weight: bold; font-size: 11px; margin-bottom: 5px; color: #38bdf8;">🤖 SmolLM 助手</div>
-                        <div style="font-size: 13px; line-height: 1.6;">{safe_text}</div>
+        html_body = []
+        for msg in self.conversation_history:
+            role = msg["role"]
+            content = html.escape(msg["content"]).replace("\n", "<br>")
+            if role == "user":
+                html_body.append(f"""
+                <div style="margin: 12px 0; text-align: right;">
+                    <div style="display: inline-block; background: #2563eb; color: #ffffff; padding: 10px 16px; border-radius: 12px; max-width: 80%; text-align: left;">
+                        <div style="font-weight: bold; font-size: 11px; margin-bottom: 4px; color: #bfdbfe;">👤 提問者 (You)</div>
+                        <div style="font-size: 13px; line-height: 1.5;">{content}</div>
                     </div>
                 </div>
-                """
-                self.chat_browser.append(bubble_html)
+                """)
+            elif role == "assistant":
+                html_body.append(f"""
+                <div style="margin: 12px 0; text-align: left;">
+                    <div style="display: inline-block; background-color: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 12px 16px; border-radius: 12px; max-width: 85%; text-align: left;">
+                        <div style="font-weight: bold; font-size: 11px; margin-bottom: 5px; color: #38bdf8;">🤖 SmolLM 助手</div>
+                        <div style="font-size: 13px; line-height: 1.6;">{content}</div>
+                    </div>
+                </div>
+                """)
 
-        # Scroll to bottom
+        if streaming_response is not None:
+            content = html.escape(streaming_response).replace("\n", "<br>")
+            html_body.append(f"""
+            <div style="margin: 12px 0; text-align: left;">
+                <div style="display: inline-block; background-color: #1e293b; border: 1px solid #38bdf8; color: #f8fafc; padding: 12px 16px; border-radius: 12px; max-width: 85%; text-align: left;">
+                    <div style="font-weight: bold; font-size: 11px; margin-bottom: 5px; color: #38bdf8;">🤖 SmolLM 助手 (生成中...)</div>
+                    <div style="font-size: 13px; line-height: 1.6;">{content}</div>
+                </div>
+            </div>
+            """)
+
+        full_html = f"""
+        <html>
+        <body style="background-color: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; margin: 8px;">
+            {''.join(html_body)}
+        </body>
+        </html>
+        """
+
         sb = self.chat_browser.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        was_at_bottom = sb.value() >= (sb.maximum() - 40)
+
+        self.chat_browser.setHtml(full_html)
+
+        if was_at_bottom or streaming_response is not None:
+            sb.setValue(sb.maximum())
 
     def start_loading_model(self):
         selected_data = self.model_combo.currentData()
@@ -444,8 +471,9 @@ class SmolLMAssistantWindow(QMainWindow):
 
         self.input_edit.clear()
 
-        # Add user message to UI
-        self.append_message_to_html("user", user_text)
+        # Add user message to conversation history
+        self.conversation_history.append({"role": "user", "content": user_text})
+        self.render_chat()
 
         # Build messages payload
         messages = []
@@ -456,23 +484,12 @@ class SmolLMAssistantWindow(QMainWindow):
         for msg in self.conversation_history:
             messages.append(msg)
 
-        messages.append({"role": "user", "content": user_text})
-
-        # Append assistant header
-        start_assistant_html = """
-        <div style="margin: 12px 0;">
-            <div style="background-color: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 12px 16px; border-radius: 12px; max-width: 88%;">
-                <div style="font-weight: bold; font-size: 11px; margin-bottom: 5px; color: #38bdf8;">🤖 SmolLM 助手</div>
-                <div id="current_stream_response" style="font-size: 13px; line-height: 1.6; white-space: pre-wrap;">
-        """
-        self.chat_browser.append(start_assistant_html)
-
         # UI buttons state
         self.send_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.speed_label.setText("⚡ 正在思考中...")
 
-        self.current_assistant_text = ""
+        self.current_streaming_text = ""
 
         # Launch generation worker
         self.gen_worker = TextGeneratorWorker(
@@ -482,27 +499,21 @@ class SmolLMAssistantWindow(QMainWindow):
             max_new_tokens=self.max_tokens_spin.value(),
             temperature=self.temp_spin.value(),
             top_p=self.topp_spin.value(),
+            repetition_penalty=self.rep_spin.value(),
         )
         self.gen_worker.token_signal.connect(self.on_token_received)
-        self.gen_worker.finished_signal.connect(lambda full, elapsed, count: self.on_generation_finished(user_text, full, elapsed, count))
+        self.gen_worker.finished_signal.connect(self.on_generation_finished)
         self.gen_worker.error_signal.connect(self.on_generation_error)
         self.gen_worker.start()
 
     def on_token_received(self, token: str):
-        self.current_assistant_text += token
-        self.chat_browser.moveCursor(self.chat_browser.textCursor().MoveOperation.End)
-        self.chat_browser.insertPlainText(token)
-        sb = self.chat_browser.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self.current_streaming_text += token
+        self.render_chat(streaming_response=self.current_streaming_text)
 
-    def on_generation_finished(self, user_text: str, full_response: str, elapsed: float, token_count: int):
-        # Close HTML block
-        close_html = "</div></div></div>"
-        self.chat_browser.append(close_html)
-
-        # Update history
-        self.conversation_history.append({"role": "user", "content": user_text})
+    def on_generation_finished(self, full_response: str, elapsed: float, token_count: int):
         self.conversation_history.append({"role": "assistant", "content": full_response})
+        self.current_streaming_text = ""
+        self.render_chat()
 
         # Calculate speed
         speed = round(token_count / elapsed, 1) if elapsed > 0 else 0
@@ -512,7 +523,9 @@ class SmolLMAssistantWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
 
     def on_generation_error(self, err_msg: str):
-        self.chat_browser.append(f"<div style='color: #ef4444;'>❌ 生成過程中發生錯誤: {html.escape(err_msg)}</div></div></div>")
+        self.conversation_history.append({"role": "assistant", "content": f"[錯誤: {err_msg}]"})
+        self.current_streaming_text = ""
+        self.render_chat()
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.speed_label.setText("")
@@ -524,7 +537,8 @@ class SmolLMAssistantWindow(QMainWindow):
 
     def clear_chat(self):
         self.conversation_history.clear()
-        self.render_initial_welcome()
+        self.current_streaming_text = ""
+        self.render_chat()
         self.speed_label.setText("")
 
 
@@ -532,7 +546,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_THEME)
 
-    # Set default application font
     font = QFont("Segoe UI", 10)
     app.setFont(font)
 

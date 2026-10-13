@@ -65,9 +65,12 @@ class ModelLoaderWorker(QThread):
                 trust_remote_code=True,
             )
 
+            # Ensure pad_token exists
+            if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+
             # Determine dtype
             if device == "cuda":
-                # Check for bfloat16 capability or use float16
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             else:
                 dtype = torch.float32
@@ -108,6 +111,7 @@ class TextGeneratorWorker(QThread):
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        repetition_penalty: float = 1.15,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -116,6 +120,7 @@ class TextGeneratorWorker(QThread):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
         self.stop_criteria = StopSignalCriteria()
 
     def request_stop(self):
@@ -155,7 +160,13 @@ class TextGeneratorWorker(QThread):
                 "streamer": streamer,
                 "max_new_tokens": self.max_new_tokens,
                 "stopping_criteria": stopping_list,
+                "repetition_penalty": float(self.repetition_penalty),
             }
+
+            if self.tokenizer.pad_token_id is not None:
+                gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+            if self.tokenizer.eos_token_id is not None:
+                gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
             if self.temperature > 0.05:
                 gen_kwargs["do_sample"] = True
