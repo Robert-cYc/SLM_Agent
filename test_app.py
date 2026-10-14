@@ -90,19 +90,21 @@ def test_markdown_sanitization():
 def test_render_message_user_and_assistant():
     from chat_renderer import ChatMessage, render_message, STREAMING_CURSOR
 
-    # User message
+    # User message (aligned right with bubble)
     msg_user = ChatMessage(role="user", content="Hello!")
     html_user = render_message(0, msg_user)
     assert "Hello!" in html_user
     assert "你" in html_user
+    assert 'align="right"' in html_user
 
-    # Assistant message (non-streaming)
+    # Assistant message (non-streaming, aligned left)
     msg_asst = ChatMessage(role="assistant", content="Hi there!", meta="25.4 tok/s")
     html_asst = render_message(1, msg_asst, streaming=False)
     assert "Hi there!" in html_asst
     assert "SmolLM" in html_asst
     assert "25.4 tok/s" in html_asst
     assert 'href="copy:1"' in html_asst
+    assert '<td width="44" valign="top">' in html_asst
 
     # Assistant message (streaming)
     html_stream = render_message(1, msg_asst, streaming=True)

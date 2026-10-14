@@ -86,12 +86,35 @@ def _avatar(style: _RoleStyle) -> str:
 
 
 def render_message(index: int, message: ChatMessage, streaming: bool = False) -> str:
-    """Render one transcript row. `index` is used for per-message actions (copy)."""
+    """Render one transcript row. `index` is used for per-message actions (copy).
+
+    User messages ('你') are aligned to the right with an elevated chat bubble and
+    right-aligned avatar. Assistant and system messages are aligned to the left.
+    """
     style = _ROLE_STYLES.get(message.role, _ROLE_STYLES["assistant"])
 
     if message.role == "user":
-        body = plain_text_to_html(message.content)
-    elif message.role == "error":
+        escaped_lines = html.escape(message.content).replace("\n", "<br>")
+        bubble = (
+            f'<table cellspacing="0" cellpadding="10" bgcolor="{Palette.ELEVATED}" '
+            f'style="border: 1px solid {Palette.BORDER}; border-radius: 8px;">'
+            f'<tr><td align="left" style="color: {Palette.TEXT}; font-size: 14px; line-height: 150%;">'
+            f"{escaped_lines}"
+            "</td></tr></table>"
+        )
+        return (
+            '<table width="100%" cellspacing="0" cellpadding="0" style="margin-top: 20px;">'
+            "<tr>"
+            '<td width="60"></td>'
+            '<td valign="top" align="right">'
+            f"{bubble}"
+            "</td>"
+            '<td width="16"></td>'
+            f'<td width="28" valign="top" align="right">{_avatar(style)}</td>'
+            "</tr></table>"
+        )
+
+    if message.role == "error":
         body = f'<p class="error">{html.escape(message.content)}</p>'
     elif streaming and not message.content.strip():
         body = '<p class="meta">思考中…</p>'
